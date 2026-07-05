@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Liquid Finger Ripple - Bug Fixed</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: "Segoe UI", system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; position: absolute; inset: 0; z-index: 10; }
+    #video { display: none; }
+    .hud {
+      position: fixed; left: 20px; top: 20px; z-index: 20;
+      color: #fff; background: rgba(0,0,0,0.46); border: 1px solid rgba(255,255,255,0.08);
+      padding: 15px; border-radius: 12px; pointer-events: none; backdrop-filter: blur(5px);
+      max-width: min(360px, calc(100vw - 40px));
+    }
+    .hud h1 { font-size: 16px; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 1px; }
+    .hud p { font-size: 12px; opacity: 0.85; line-height: 1.4; }
+    .status { color: #63d7ff; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <h1>Liquid Interaction</h1>
+    <p>1. Move fingers to ripple.<br />2. <span class="status">Grab (Pinch)</span> to form a water ball.<br />3. <span class="status">Release</span> to splash!</p>
+    <p id="debug-info" style="margin-top:10px;color:#ffd966;">Loading models...</p>
+  </div>
+
+  <video id="video" playsinline autoplay muted></video>
+
+  <script type="module">
+    const videoElement = document.getElementById("video");
+    const debugInfo = document.getElementById("debug-info");
+
+    function setDebug(message) {
+      debugInfo.textContent = message;
+    }
+
+    function loadScript(urls, timeout = 10000) {
+      return new Promise((resolve, reject) => {
+        let index = 0;
+
+        const tryNext = () => {
+          if (index >= urls.length) {
+            reject(new Error(`Failed to load script: ${urls[urls.length - 1]}`));
+            return;
+          }
+
+          const url = urls[index++];
+          const script = document.createElement("script");
+          let settled = false;
+          const timer = window.setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            script.remove();
+            tryNext();
+          }, timeout);
+
+          script.src = url;
+          script.crossOrigin = "anonymous";
+          script.onload = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve(url);
+          };
+          script.onerror = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            script.remove();
+            tryNext();
+          };
+          document.head.appendChild(script);
+        };
+
+        tryNext();
+      });
+    }
+
+    async function loadThree() {
+      const candidates = [
+        "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+      ];
+
+      for (const url of candidates) {
+        try {
+          return await import(url);
+        } catch (error) {
+          console.warn("Failed to import Three.js from", url, error);
+        }
+      }
+
+      throw new Error("Three.js CDN unavailable");
+    }
+
+    async function loadMediaPipe() {
+      const scriptGroups = [
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js",
+          "https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js",
+          "https://unpkg.com/@mediapipe/control_utils/control_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js",
+          "https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"
+        ],
+        [
+          "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
+          "https://unpkg.com/@mediapipe/hands/hands.js"
+        ]
+      ];
+
+      for (const group of scriptGroups) {
+        await loadScript(group);
+      }
+
+      if (!window.Hands || !window.Camera) {
+        throw new Error("MediaPipe globals unavailable");
+      }
+    }
+
+    async function main() {
+      setDebug("Loading renderer...");
+      const THREE = await loadThree();
+
+      let width = window.innerWidth;
+      let height = window.innerHeight;
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(width, height);
+      document.body.appendChild(renderer.domElement);
+
+      const displayScene = new THREE.Scene();
+      const simScene = new THREE.Scene();
+      const displayCamera = new THREE.Camera();
+      const simCamera = new THREE.Camera();
+
+      const createTarget = () =>
+      new THREE.WebGLRenderTarget(width, height, {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        type: THREE.HalfFloatType,
+        depthBuffer: false,
+        stencilBuffer: false
+      });
+
+      let prevTarget = createTarget();
+      let currTarget = createTarget();
+      let nextTarget = createTarget();
+
+      const clearTarget = (target) => {
+        renderer.setRenderTarget(target);
+        renderer.setClearColor(0x000000, 1);
+        renderer.clear(true, true, true);
+      };
+
+      clearTarget(prevTarget);
+      clearTarget(currTarget);
+      clearTarget(nextTarget);
+      renderer.setRenderTarget(null);
+
+      const videoTexture = new THREE.VideoTexture(videoElement);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.colorSpace = THREE.SRGBColorSpace;
+
+      const quadGeo = new THREE.PlaneGeometry(2, 2);
+
+    // ========== 物理模拟 Shader ==========
+      const simMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uPrevTexture: { value: prevTarget.texture },
+        uCurrTexture: { value: currTarget.texture },
+        uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
+        uAspect: { value: width / height },
+        uInteractionCenter: { value: new THREE.Vector2(0.5, 0.5) },
+        uState: { value: 0 },
+        uBlast: { value: 0 },
+        uTime: { value: 0 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+      `,
+      fragmentShader: `
+        precision highp float;
+        varying vec2 vUv;
+        uniform sampler2D uPrevTexture;
+        uniform sampler2D uCurrTexture;
+        uniform vec2 uTexelSize;
+        uniform float uAspect;
+        uniform vec2 uInteractionCenter;
+        uniform int uState;
+        uniform float uBlast;
+        uniform float uTime;
+
+        void main() {
+          float curr = texture2D(uCurrTexture, vUv).r;
+          float prev = texture2D(uPrevTexture, vUv).r;
+
+          float disturbance = 0.0;
+          float damping = 0.980;
+
+          if (uState == 0) {
+            // 修复 Bug 4：只用交互中心产生一个波纹，而不是 5 个分散波纹
+            vec2 distVec = vUv - uInteractionCenter;
+            distVec.x *= uAspect;
+            float dist = length(distVec);
+            
+            float press = exp(-dist * 50.0);
+            float ring = exp(-pow(max(dist - 0.02, 0.0) * 40.0, 2.0));
+            disturbance = (-press * 0.008 + ring * 0.005);
+          } 
+          else if (uState == 1) {
+            // 捏合：形成水球，阻尼调高让水球稳定存在
+            vec2 ballDelta = vUv - uInteractionCenter;
+            ballDelta.x *= uAspect;
+            float ballShape = exp(-length(ballDelta) * 5.0) * 0.25;
+            curr = mix(curr, ballShape, 0.3);
+            damping = 0.97; // 修复 Bug 3：水球阻尼从 0.90 提高到 0.97
+            disturbance = 0.0;
+          } 
+          else if (uState == 2) {
+            // 释放：多重波纹 + 中心凹陷
+            vec2 splashDelta = vUv - uInteractionCenter;
+            splashDelta.x *= uAspect;
+            float dist = length(splashDelta);
+            
+            float ring1 = exp(-pow(dist - 0.04, 2.0) * 150.0) * uBlast * 0.6;
+            float ring2 = exp(-pow(dist - 0.09, 2.0) * 100.0) * uBlast * 0.3;
+            float hole = -exp(-dist * 15.0) * uBlast * 0.4;
+            disturbance = ring1 + ring2 + hole;
+            damping = 0.985;
+          }
+
+          curr += disturbance;
+
+          float left = texture2D(uCurrTexture, vUv - vec2(uTexelSize.x, 0.0)).r;
+          float right = texture2D(uCurrTexture, vUv + vec2(uTexelSize.x, 0.0)).r;
+          float down = texture2D(uCurrTexture, vUv - vec2(0.0, uTexelSize.y)).r;
+          float up = texture2D(uCurrTexture, vUv + vec2(0.0, uTexelSize.y)).r;
+          float laplacian = (left + right + up + down) - 4.0 * curr;
+
+          float next = 2.0 * curr - prev + 0.22 * laplacian;
+          next *= damping;
+
+          gl_FragColor = vec4(next, 0.0, 0.0, 1.0);
+        }
+      `
+    });
+
+    // ========== 显示 Shader ==========
+      const displayMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uHeightTexture: { value: currTarget.texture },
+        uVideoTexture: { value: videoTexture },
+        uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+      `,
+      fragmentShader: `
+        precision highp float;
+        varying vec2 vUv;
+        uniform sampler2D uHeightTexture;
+        uniform sampler2D uVideoTexture;
+        uniform vec2 uTexelSize;
+
+        void main() {
+          float h = texture2D(uHeightTexture, vUv).r;
+          float hLeft = texture2D(uHeightTexture, vUv - vec2(uTexelSize.x, 0.0)).r;
+          float hRight = texture2D(uHeightTexture, vUv + vec2(uTexelSize.x, 0.0)).r;
+          float hDown = texture2D(uHeightTexture, vUv - vec2(0.0, uTexelSize.y)).r;
+          float hUp = texture2D(uHeightTexture, vUv + vec2(0.0, uTexelSize.y)).r;
+
+          vec3 normal = normalize(vec3((hLeft - hRight) * 8.0, (hDown - hUp) * 8.0, 1.0));
+
+          vec2 refractUV = clamp(vUv + normal.xy * 0.020, 0.0, 1.0);
+          float r = texture2D(uVideoTexture, clamp(refractUV + normal.xy * 0.003, 0.0, 1.0)).r;
+          float g = texture2D(uVideoTexture, refractUV).g;
+          float b = texture2D(uVideoTexture, clamp(refractUV - normal.xy * 0.003, 0.0, 1.0)).b;
+          vec3 videoColor = vec3(r, g, b);
+          
+          float ao = smoothstep(-0.1, 0.1, h);
+          videoColor *= 0.85 + 0.15 * ao;
+
+          vec3 lightDir = normalize(vec3(-0.45, 0.55, 1.0));
+          vec3 viewDir = vec3(0.0, 0.0, 1.0);
+          vec3 halfVec = normalize(lightDir + viewDir);
+
+          float spec = pow(max(dot(normal, halfVec), 0.0), 128.0);
+          float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 3.0);
+
+          vec3 finalColor = videoColor;
+          finalColor += vec3(1.0, 1.0, 1.0) * spec * 2.0;
+          finalColor += vec3(0.22, 0.45, 0.68) * fresnel * 0.22;
+
+          gl_FragColor = vec4(finalColor, 1.0);
+        }
+      `
+    });
+
+      simScene.add(new THREE.Mesh(quadGeo, simMaterial));
+      displayScene.add(new THREE.Mesh(quadGeo, displayMaterial));
+
+      const fingertipIndices = [4, 8, 12, 16, 20];
+      const pointerState = Array.from({ length: 5 }, () => ({
+        current: new THREE.Vector2(0.5, 0.5),
+        previous: new THREE.Vector2(0.5, 0.5)
+      }));
+
+      const interactionCenter = new THREE.Vector2(0.5, 0.5);
+      const splashCenter = new THREE.Vector2(0.5, 0.5);
+      let currentState = 0;
+      let releaseFrames = 0;
+      let blastStrength = 0;
+      let usingCamera = false;
+      let mouseFallback = false;
+      let mouseDown = false;
+
+      function enableMouseFallback(message) {
+        usingCamera = false;
+        mouseFallback = true;
+        setDebug(message);
+      }
+
+      function updateMousePointer(event) {
+        const x = event.clientX / window.innerWidth;
+        const y = 1.0 - event.clientY / window.innerHeight;
+        pointerState[0].current.set(x, y);
+        interactionCenter.copy(pointerState[0].current);
+      }
+
+      window.addEventListener("pointermove", (event) => {
+        if (!mouseFallback) return;
+        updateMousePointer(event);
+        currentState = mouseDown ? 1 : 0;
+      });
+      window.addEventListener("pointerdown", (event) => {
+        if (!mouseFallback) return;
+        mouseDown = true;
+        updateMousePointer(event);
+        currentState = 1;
+      });
+      window.addEventListener("pointerup", () => {
+        if (!mouseFallback) return;
+        mouseDown = false;
+        currentState = 2;
+        releaseFrames = 15;
+        blastStrength = 1.0;
+        splashCenter.copy(interactionCenter);
+      });
+
+      async function initCameraStream() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+        videoElement.srcObject = stream;
+        await videoElement.play();
+        usingCamera = true;
+        mouseFallback = false;
+        setDebug("Camera active. Loading hand tracking...");
+      }
+
+      async function setupHands() {
+        try {
+          setDebug("Loading hand tracking...");
+          await loadMediaPipe();
+          await initCameraStream();
+
+          const hands = new window.Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+          });
+
+          hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+          });
+
+          hands.onResults((results) => {
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+              if (usingCamera) {
+                currentState = 0;
+                setDebug("Camera active. Show your hand!");
+              }
+              return;
+            }
+
+            const landmarks = results.multiHandLandmarks[0];
+            const palmRef = landmarks[9];
+            let totalDist = 0;
+            let avgX = 0;
+            let avgY = 0;
+
+            fingertipIndices.forEach((idx, i) => {
+              const lm = landmarks[idx];
+              const targetX = lm.x;
+              const targetY = 1.0 - lm.y;
+              const state = pointerState[i];
+
+              state.current.x += (targetX - state.current.x) * 0.3;
+              state.current.y += (targetY - state.current.y) * 0.3;
+              state.previous.copy(state.current);
+
+              const dx = lm.x - palmRef.x;
+              const dy = lm.y - palmRef.y;
+              totalDist += Math.sqrt(dx * dx + dy * dy);
+              avgX += state.current.x;
+              avgY += state.current.y;
+            });
+
+            interactionCenter.set(avgX / 5.0, avgY / 5.0);
+            const avgDist = totalDist / 5.0;
+
+            if (avgDist < 0.12) {
+              currentState = 1;
+              releaseFrames = 0;
+            } else if (avgDist > 0.25 && currentState === 1) {
+              currentState = 2;
+              releaseFrames = 15;
+              blastStrength = 1.0;
+              splashCenter.copy(interactionCenter);
+            } else if (releaseFrames > 0) {
+              currentState = 2;
+            } else {
+              currentState = 0;
+            }
+
+            setDebug(`State: ${currentState === 0 ? "Move" : currentState === 1 ? "GRAB (Water Ball)" : "SPLASH!"} | Dist: ${avgDist.toFixed(3)}`);
+          });
+
+          const cameraFeed = new window.Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 1280,
+            height: 720
+          });
+          cameraFeed.start();
+        } catch (error) {
+          enableMouseFallback(`Hand tracking unavailable. Mouse fallback active: ${error.message}`);
+        }
+      }
+
+      const clock = new THREE.Clock();
+
+      function animate() {
+        requestAnimationFrame(animate);
+        const time = clock.getElapsedTime();
+
+        if (mouseFallback) {
+          if (releaseFrames > 0) currentState = 2;
+          else if (!mouseDown) currentState = 0;
+        }
+
+        if (releaseFrames > 0) releaseFrames -= 1;
+        else if (currentState === 2) currentState = 0;
+
+        blastStrength *= 0.92;
+
+        simMaterial.uniforms.uPrevTexture.value = prevTarget.texture;
+        simMaterial.uniforms.uCurrTexture.value = currTarget.texture;
+        simMaterial.uniforms.uInteractionCenter.value.copy(currentState === 2 ? splashCenter : interactionCenter);
+        simMaterial.uniforms.uState.value = currentState;
+        simMaterial.uniforms.uBlast.value = blastStrength;
+        simMaterial.uniforms.uTime.value = time;
+
+        if (videoElement.readyState >= 2) videoTexture.needsUpdate = true;
+
+        renderer.setRenderTarget(nextTarget);
+        renderer.render(simScene, simCamera);
+
+        const oldPrev = prevTarget;
+        prevTarget = currTarget;
+        currTarget = nextTarget;
+        nextTarget = oldPrev;
+
+        displayMaterial.uniforms.uHeightTexture.value = currTarget.texture;
+
+        renderer.setRenderTarget(null);
+        renderer.render(displayScene, displayCamera);
+      }
+
+      window.addEventListener("resize", () => {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        renderer.setSize(width, height);
+        prevTarget.setSize(width, height);
+        currTarget.setSize(width, height);
+        nextTarget.setSize(width, height);
+        simMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
+        simMaterial.uniforms.uAspect.value = width / height;
+        displayMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
+        clearTarget(prevTarget);
+        clearTarget(currTarget);
+        clearTarget(nextTarget);
+        renderer.setRenderTarget(null);
+      });
+
+      setupHands();
+      animate();
+    }
+
+    main().catch((error) => {
+      console.error(error);
+      setDebug(`Startup failed: ${error.message}`);
+    });
+  </script>
+</body>
+</html>
